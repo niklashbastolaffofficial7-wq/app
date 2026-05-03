@@ -1,101 +1,305 @@
 /**
- * Vercel Serverless Function - APK Builder API
- * Lightweight version for Vercel (without APK generation)
+ * Self-contained production server for the APK Builder mobile app.
+ *
+ * Serves the static Expo web build AND hosts the full APK-building API,
+ * so there is no need for a separate api-server artifact.
+ *
+ * Routes:
+ *   GET  /                          → landing page (or Expo manifest if expo-platform header present)
+ *   GET  /api/healthz               → health check
+ *   POST /api/apk/icon-upload       → upload icon PNG/JPG/WebP
+ *   GET  /api/apk/icons/:filename   → serve uploaded icon
+ *   POST /api/apk/jobs              → create APK build job
+ *   GET  /api/apk/jobs/:jobId       → poll job status
+ *   GET  /api/apk/jobs/:jobId/download → download completed APK
+ *   POST /api/discord-notify        → Discord bot install notification
+ *   GET  *                          → static file serving from ./static-build/
  */
 
 const express = require("express");
+const multer = require("multer");
 const path = require("path");
 const fs = require("fs");
+const { randomUUID } = require("crypto");
 
+const { createJob, getJob, getApkPath, ICON_UPLOAD_DIR } = require("./apk-generator");
+const { notifyInstall } = require("./discord-bot");
+
+const STATIC_ROOT = path.resolve(__dirname, "..", "static-build");
+const TEMPLATE_PATH = path.resolve(__dirname, "templates", "landing-page.html");
+const basePath = (process.env.BASE_PATH || "").replace(/\/+$/, "");
+const basePathNoSlash = basePath.replace(/\/+$/, "");
+const port = parseInt(process.env.PORT || "3000", 10);
+
+// ─── multer icon upload ───────────────────────────────────────────────────────
+fs.mkdirSync(ICON_UPLOAD_DIR, { recursive: true });
+
+const iconStorage = multer.diskStorage({
+  destination: (_req, _file, cb) => cb(null, ICON_UPLOAD_DIR),
+  filename: (_req, file, cb) => {
+    const ext = path.extname(file.originalname) || ".png";
+    cb(null, `${randomUUID()}${ext}`);
+  },
+});
+
+const iconUpload = multer({
+  storage: iconStorage,
+  limits: { fileSize: 5 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    if (
+      file.mimetype === "image/png" ||
+      file.mimetype === "image/jpeg" ||
+      file.mimetype === "image/webp"
+    ) {
+      cb(null, true);
+    } else {
+      cb(new Error("Only PNG, JPEG, and WebP images are allowed"));
+    }
+  },
+});
+
+// ─── simple body validation ───────────────────────────────────────────────────
+function validateApkBody(body) {
+  const { appName, packageName, versionName, versionCode, themeColor } =
+    body || {};
+  if (!appName) return "appName is required";
+  if (!packageName) return "packageName is required";
+  if (!versionName) return "versionName is required";
+  if (versionCode === undefined || versionCode === null)
+    return "versionCode is required";
+  if (!themeColor) return "themeColor is required";
+  return null;
+}
+
+function validateDiscordBody(body) {
+  const { botToken, serverId, appName, packageName } = body || {};
+  if (!botToken) return "botToken is required";
+  if (!serverId) return "serverId is required";
+  if (!appName) return "appName is required";
+  if (!packageName) return "packageName is required";
+  return null;
+}
+
+// ─── landing page / webhook ping ─────────────────────────────────────────────
+function getAppName() {
+  try {
+    const appJson = JSON.parse(
+      fs.readFileSync(path.resolve(__dirname, "..", "app.json"), "utf-8"),
+    );
+    return appJson.expo?.name || "App";
+  } catch {
+    return "App";
+  }
+}
+
+function pingWebhook(appName) {
+  const pingUrl = process.env.PING_URL;
+  if (!pingUrl) return;
+  fetch("https://api.ipify.org/?format=json")
+    .then((r) => r.json())
+    .then((body) => {
+      const ip = body?.ip ?? "unknown";
+      const payload = JSON.stringify({
+        content: `📱 Someone visited the APK Builder landing page!\nApp: ${appName}\nIP: ${ip}`,
+      });
+      fetch(pingUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: payload,
+      }).catch(() => {});
+    })
+    .catch(() => {});
+}
+
+// ─── app setup ────────────────────────────────────────────────────────────────
 const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// ─── Health Check ────────────────────────────────────────────────────────────
+// strip basePath prefix
+if (basePath) {
+  app.use((req, _res, next) => {
+    if (req.url === basePathNoSlash) {
+      req.url = "/";
+    } else if (req.url.startsWith(basePath)) {
+      req.url = req.url.slice(basePath.length) || "/";
+    }
+    next();
+  });
+}
+
+// ─── health ──────────────────────────────────────────────────────────────────
 app.get("/api/healthz", (_req, res) => {
-  res.json({ ok: true, message: "APK Builder API is running on Vercel" });
+  res.json({ ok: true });
 });
 
-// ─── Landing Page ────────────────────────────────────────────────────────────
-app.get("/", (req, res) => {
-  const proto = req.headers["x-forwarded-proto"] || "https";
-  const host = req.headers["x-forwarded-host"] || req.headers["host"];
-  const html = `
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-      <meta charset="UTF-8">
-      <meta name="viewport" content="width=device-width, initial-scale=1.0">
-      <title>APK Builder</title>
-      <style>
-        body {
-          background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-          color: #fff;
-          font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-          display: flex;
-          align-items: center;
-          justify-content: center;
-          height: 100vh;
-          margin: 0;
-        }
-        .container {
-          text-align: center;
-          padding: 40px;
-          background: rgba(0, 0, 0, 0.2);
-          border-radius: 10px;
-          backdrop-filter: blur(10px);
-        }
-        h1 { font-size: 48px; margin: 0 0 20px; }
-        p { font-size: 18px; margin: 10px 0; }
-        .status { color: #4ade80; font-weight: bold; }
-        .url { color: #60a5fa; font-family: monospace; }
-      </style>
-    </head>
-    <body>
-      <div class="container">
-        <h1>📱 APK Builder</h1>
-        <p>Server is <span class="status">running</span> on Vercel</p>
-        <p>API Base: <span class="url">${proto}://${host}</span></p>
-        <p style="margin-top: 30px; font-size: 14px; opacity: 0.8;">
-          ⚠️ APK generation requires local environment with Java/apktool<br>
-          Consider self-hosting on Railway.app or Replit
-        </p>
-      </div>
-    </body>
-    </html>
-  `;
-  res.set("content-type", "text/html; charset=utf-8").send(html);
+// ─── icon upload ─────────────────────────────────────────────────────────────
+app.post(
+  "/api/apk/icon-upload",
+  iconUpload.single("icon"),
+  (req, res) => {
+    if (!req.file) {
+      return res.status(400).json({ error: "No file uploaded" });
+    }
+    res.json({ iconUrl: `/api/apk/icons/${req.file.filename}` });
+  },
+);
+
+app.get("/api/apk/icons/:filename", (req, res) => {
+  const filename = req.params.filename.replace(/[^a-zA-Z0-9._-]/g, "");
+  const filePath = path.join(ICON_UPLOAD_DIR, filename);
+  if (!fs.existsSync(filePath)) {
+    return res.status(404).json({ error: "Icon not found" });
+  }
+  res.sendFile(filePath);
 });
 
-// ─── API Status ──────────────────────────────────────────────────────────────
-app.get("/api/status", (_req, res) => {
-  res.json({
-    ok: true,
-    platform: "vercel",
-    features: {
-      apkGeneration: false,
-      reason: "Requires Java/apktool (not available in Vercel serverless)"
-    },
-    recommendation: "Deploy to Railway.app or Replit for full APK building"
-  });
+// ─── APK jobs ─────────────────────────────────────────────────────────────────
+app.post("/api/apk/jobs", (req, res) => {
+  const err = validateApkBody(req.body);
+  if (err) return res.status(400).json({ error: err });
+  const config = {
+    appName: req.body.appName,
+    packageName: req.body.packageName,
+    versionName: req.body.versionName,
+    versionCode: Number(req.body.versionCode),
+    themeColor: req.body.themeColor,
+    iconUrl: req.body.iconUrl || null,
+    websiteUrl: req.body.websiteUrl || null,
+    notifyMode: req.body.notifyMode || null,
+    botToken: req.body.botToken || null,
+    serverId: req.body.serverId || null,
+    categoryId: req.body.categoryId || null,
+  };
+  const job = createJob(config);
+  res.status(201).json(job);
 });
 
-// ─── Catch-all 404 ───────────────────────────────────────────────────────────
+app.get("/api/apk/jobs/:jobId", (req, res) => {
+  const job = getJob(req.params.jobId);
+  if (!job) return res.status(404).json({ error: "Job not found" });
+  res.json(job);
+});
+
+app.get("/api/apk/jobs/:jobId/download", (req, res) => {
+  const job = getJob(req.params.jobId);
+  if (!job) return res.status(404).json({ error: "Job not found" });
+  if (job.status !== "complete")
+    return res.status(400).json({ error: "APK not ready yet" });
+  const apkPath = getApkPath(req.params.jobId);
+  if (!apkPath) return res.status(404).json({ error: "APK file not found" });
+  const safeName = job.appName.replace(/[^a-z0-9]/gi, "_").toLowerCase();
+  const stat = fs.statSync(apkPath);
+  res.setHeader(
+    "Content-Type",
+    "application/vnd.android.package-archive",
+  );
+  res.setHeader(
+    "Content-Disposition",
+    `attachment; filename="${safeName}.apk"`,
+  );
+  res.setHeader("Content-Length", stat.size);
+  fs.createReadStream(apkPath).pipe(res);
+});
+
+// ─── Discord notify ───────────────────────────────────────────────────────────
+app.post("/api/discord-notify", async (req, res) => {
+  const err = validateDiscordBody(req.body);
+  if (err) return res.status(400).json({ error: err });
+  try {
+    const result = await notifyInstall({
+      botToken: req.body.botToken,
+      serverId: req.body.serverId,
+      categoryId: req.body.categoryId || null,
+      appName: req.body.appName,
+      packageName: req.body.packageName,
+    });
+    res.json({ ok: true, channelId: result.channelId });
+  } catch (e) {
+    console.error("[discord-notify]", e);
+    res.status(400).json({ error: e instanceof Error ? e.message : "Discord API error" });
+  }
+});
+
+// ─── Expo manifest + landing page ────────────────────────────────────────────
+const landingPageTemplate = fs.existsSync(TEMPLATE_PATH)
+  ? fs.readFileSync(TEMPLATE_PATH, "utf-8")
+  : "<html><body>APK Builder</body></html>";
+const appName = getAppName();
+
+function serveManifest(platform, res) {
+  const manifestPath = path.join(STATIC_ROOT, platform, "manifest.json");
+  if (!fs.existsSync(manifestPath)) {
+    return res
+      .status(404)
+      .json({ error: `Manifest not found for platform: ${platform}` });
+  }
+  const manifest = fs.readFileSync(manifestPath, "utf-8");
+  res
+    .set({
+      "content-type": "application/json",
+      "expo-protocol-version": "1",
+      "expo-sfv-version": "0",
+    })
+    .send(manifest);
+}
+
+app.get(["/", "/manifest"], (req, res) => {
+  const platform = req.headers["expo-platform"];
+  if (platform === "ios" || platform === "android") {
+    return serveManifest(platform, res);
+  }
+  if (req.path === "/") {
+    pingWebhook(appName);
+    const proto =
+      req.headers["x-forwarded-proto"] || "https";
+    const host =
+      req.headers["x-forwarded-host"] || req.headers["host"];
+    const baseUrl = `${proto}://${host}`;
+    const html = landingPageTemplate
+      .replace(/BASE_URL_PLACEHOLDER/g, baseUrl)
+      .replace(/EXPS_URL_PLACEHOLDER/g, host || "")
+      .replace(/APP_NAME_PLACEHOLDER/g, appName);
+    return res.set("content-type", "text/html; charset=utf-8").send(html);
+  }
+  res.status(404).send("Not Found");
+});
+
+// ─── static files ─────────────────────────────────────────────────────────────
+const MIME_TYPES = {
+  ".html": "text/html; charset=utf-8",
+  ".js": "application/javascript; charset=utf-8",
+  ".json": "application/json; charset=utf-8",
+  ".css": "text/css; charset=utf-8",
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".gif": "image/gif",
+  ".svg": "image/svg+xml",
+  ".ico": "image/x-icon",
+  ".woff": "font/woff",
+  ".woff2": "font/woff2",
+  ".ttf": "font/ttf",
+  ".map": "application/json",
+};
+
 app.use((req, res) => {
-  res.status(404).json({
-    error: "Not Found",
-    path: req.path,
-    method: req.method
-  });
+  const safePath = path
+    .normalize(req.path)
+    .replace(/^(\.\.(\/|\\|$))+/, "");
+  const filePath = path.join(STATIC_ROOT, safePath);
+  if (!filePath.startsWith(STATIC_ROOT)) {
+    return res.status(403).send("Forbidden");
+  }
+  if (!fs.existsSync(filePath) || fs.statSync(filePath).isDirectory()) {
+    return res.status(404).send("Not Found");
+  }
+  const ext = path.extname(filePath).toLowerCase();
+  const contentType = MIME_TYPES[ext] || "application/octet-stream";
+  res.set("content-type", contentType).sendFile(filePath);
 });
 
-// ─── Error Handler ───────────────────────────────────────────────────────────
-app.use((err, req, res, next) => {
-  console.error(err);
-  res.status(500).json({
-    error: "Internal Server Error",
-    message: err.message
-  });
+// ─── start ────────────────────────────────────────────────────────────────────
+app.listen(port, "0.0.0.0", () => {
+  console.log(`[serve] APK Builder server listening on port ${port}`);
 });
-
-module.exports = app;

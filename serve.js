@@ -28,6 +28,7 @@ const { notifyInstall } = require("./discord-bot");
 const STATIC_ROOT = path.resolve(__dirname, "..", "static-build");
 const TEMPLATE_PATH = path.resolve(__dirname, "templates", "landing-page.html");
 const basePath = (process.env.BASE_PATH || "").replace(/\/+$/, "");
+const basePathNoSlash = basePath.replace(/\/+$/, "");
 const port = parseInt(process.env.PORT || "3000", 10);
 
 // ─── multer icon upload ───────────────────────────────────────────────────────
@@ -118,7 +119,9 @@ app.use(express.urlencoded({ extended: true }));
 // strip basePath prefix
 if (basePath) {
   app.use((req, _res, next) => {
-    if (req.url.startsWith(basePath)) {
+    if (req.url === basePathNoSlash) {
+      req.url = "/";
+    } else if (req.url.startsWith(basePath)) {
       req.url = req.url.slice(basePath.length) || "/";
     }
     next();
